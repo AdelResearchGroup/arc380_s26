@@ -1,0 +1,8 @@
+# VS code
+.vscode/
+*.code-workspace
+
+# ROS
+build/
+install/
+log/
