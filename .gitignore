@@ -6,3 +6,6 @@
 build/
 install/
 log/
+
+# Workshops
+src/arc380*
