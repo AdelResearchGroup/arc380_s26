@@ -1,7 +1,9 @@
+# abb_irb120_gazebo/launch/simulation.launch.py
+
 import os
 import shlex
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, get_package_prefix
 
 from launch import LaunchDescription
 from launch.actions import (
@@ -17,28 +19,40 @@ from launch.substitutions import (
     FindExecutable,
     LaunchConfiguration,
     TextSubstitution,
+    PythonExpression,
 )
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_prefix
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _split_args(arg_string: str):
     arg_string = (arg_string or "").strip()
     if not arg_string:
         return []
-    # Windows quoting differs; shlex with posix=False handles cmd-style quoting better.
     return shlex.split(arg_string, posix=(os.name != "nt"))
 
 
-def _start_gz_server(context, *args, **kwargs):
+def _start_gz(context, *args, **kwargs):
+    """
+    Cross-platform Gazebo Sim startup:
+
+    - Windows: server-only required (add -s). Optionally launch GUI separately (gz sim -g).
+    - macOS/Linux: default gz sim launches GUI+server; avoid launching a second GUI client.
+    """
     world_path = LaunchConfiguration("world").perform(context)
     gz_args_str = LaunchConfiguration("gz_args").perform(context)
+    headless = LaunchConfiguration("headless").perform(context).lower() in ("1", "true", "yes", "on")
 
     extra = _split_args(gz_args_str)
 
-    # Windows limitation: gz/ign sim works only in server mode.
-    if os.name == "nt" and "-s" not in extra and "--server" not in extra:
-        extra = ["-s"] + extra
+    if os.name == "nt":
+        # Windows requires -s (server-only) when launched this way
+        if "-s" not in extra and "--server" not in extra:
+            extra = ["-s"] + extra
+    else:
+        # macOS/Linux: only add -s if user explicitly requests headless
+        if headless and "-s" not in extra and "--server" not in extra:
+            extra = ["-s"] + extra
 
     cmd = [FindExecutable(name="gz").perform(context), "sim"] + extra + [world_path]
     return [ExecuteProcess(cmd=cmd, output="screen")]
@@ -53,7 +67,6 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration("use_sim_time")
     xacro_file = LaunchConfiguration("xacro_file")
-    world = LaunchConfiguration("world")
     robot_name = LaunchConfiguration("robot_name")
 
     x = LaunchConfiguration("x")
@@ -66,6 +79,7 @@ def generate_launch_description():
     gz_args = LaunchConfiguration("gz_args")
     start_gui = LaunchConfiguration("start_gui")
     gui_delay = LaunchConfiguration("gui_delay")
+    headless = LaunchConfiguration("headless")
 
     declare_args = [
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -88,24 +102,31 @@ def generate_launch_description():
         DeclareLaunchArgument("yaw", default_value="0.0"),
         DeclareLaunchArgument(
             "gz_args",
-            # On Windows, we will auto-prepend -s in _start_gz_server anyway.
             default_value=TextSubstitution(text="-r"),
             description="Extra args passed to `gz sim` (excluding world path). Example: '-r -v 4'",
         ),
         DeclareLaunchArgument(
+            "headless",
+            # Windows effectively headless in this workflow; mac/linux default is GUI unless set true.
+            default_value=("true" if os.name == "nt" else "false"),
+            description="Run gz sim headless/server-only (-s).",
+        ),
+        DeclareLaunchArgument(
             "start_gui",
-            default_value="false",
-            description="Start a separate `gz sim -g` GUI client (recommended on Windows).",
+            # Only meaningful on Windows (starts separate GUI client process).
+            default_value=("true" if os.name == "nt" else "false"),
+            description="(Windows) Start a separate `gz sim -g` GUI client.",
         ),
         DeclareLaunchArgument(
             "gui_delay",
             default_value="2.0",
-            description="Seconds to wait before starting GUI client (helps ensure server is up).",
+            description="Seconds to wait before starting GUI client (Windows).",
         ),
     ]
 
     # -------------------------
-    # Gazebo resource paths (critical so GUI can render meshes)
+    # Gazebo resource paths for model:// resolution
+    # model://<pkg>/... requires GZ_SIM_RESOURCE_PATH contain <install_prefix>/share
     # -------------------------
     gazebo_prefix_share = os.path.join(get_package_prefix("abb_irb120_gazebo"), "share")
     desc_prefix_share = os.path.join(get_package_prefix("abb_irb120_description"), "share")
@@ -117,11 +138,10 @@ def generate_launch_description():
         [
             p
             for p in [
-                gazebo_prefix_share,   # contains abb_irb120_gazebo/
-                desc_prefix_share,     # contains abb_irb120_description/
+                gazebo_prefix_share,
+                desc_prefix_share,
                 worlds_dir,
                 models_dir,
-                # keep the direct shares too (harmless / can help for other URI styles)
                 gazebo_share,
                 desc_share,
             ]
@@ -147,7 +167,7 @@ def generate_launch_description():
         ],
     )
 
-    # Gazebo log path (avoids ~/.gz permission / missing-dir issues on Windows conda)
+    # Put gz logs somewhere writable across platforms
     gz_log_dir = os.path.join(os.path.expanduser("~"), ".ros", "gz_logs")
     set_gz_log_path = SetEnvironmentVariable(name="GZ_SIM_LOG_PATH", value=gz_log_dir)
     set_gz_log_path_legacy = SetEnvironmentVariable(name="GZ_LOG_PATH", value=gz_log_dir)
@@ -155,13 +175,10 @@ def generate_launch_description():
     # -------------------------
     # Robot description + RSP
     # -------------------------
-    robot_description = Command(
-        [
-            FindExecutable(name="xacro"),
-            TextSubstitution(text=" "),
-            xacro_file,
-        ]
+    robot_description_cmd = Command(
+        [FindExecutable(name="xacro"), TextSubstitution(text=" "), xacro_file]
     )
+    robot_description = ParameterValue(robot_description_cmd, value_type=str)
 
     robot_state_publisher = Node(
         package="robot_state_publisher",
@@ -172,12 +189,17 @@ def generate_launch_description():
     )
 
     # -------------------------
-    # Start gz server (always)
+    # Start gz (single process on mac/linux; server-only on Windows)
     # -------------------------
-    gz_server = OpaqueFunction(function=_start_gz_server)
+    gz = OpaqueFunction(function=_start_gz)
 
-    # Optional: start gz GUI client in the same launch environment
-    # On Windows, this is the supported way (server + separate GUI process).
+    # -------------------------
+    # (Windows only) Start GUI client in a second process if requested
+    # -------------------------
+    is_windows_and_start_gui = IfCondition(
+        PythonExpression(["'", "true" if os.name == "nt" else "false", "' == 'true' and ", start_gui])
+    )
+
     gz_gui = TimerAction(
         period=gui_delay,
         actions=[
@@ -186,7 +208,7 @@ def generate_launch_description():
                 output="screen",
             )
         ],
-        condition=IfCondition(start_gui),
+        condition=is_windows_and_start_gui,
     )
 
     # -------------------------
@@ -234,7 +256,7 @@ def generate_launch_description():
             set_ign_resource_path,
             set_gz_log_path,
             set_gz_log_path_legacy,
-            gz_server,
+            gz,
             gz_gui,
             robot_state_publisher,
             clock_bridge,
