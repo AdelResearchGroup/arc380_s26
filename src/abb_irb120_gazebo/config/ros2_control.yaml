@@ -1,0 +1,29 @@
+ros2_control:
+  ros__parameters:
+    update_rate: 250  # Hz
+
+    hardware:
+      plugin: gz_ros2_control/GazeboSimSystem
+      # Some installs use a different plugin string; if this doesn't load, check:
+      #   ros2 pkg executables gz_ros2_control
+      #   strings on the plugin library / docs for your distro
+
+    joints:
+      - name: joint_1
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
+      - name: joint_2
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
+      - name: joint_3
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
+      - name: joint_4
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
+      - name: joint_5
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
+      - name: joint_6
+        command_interfaces: [position]
+        state_interfaces: [position, velocity]
