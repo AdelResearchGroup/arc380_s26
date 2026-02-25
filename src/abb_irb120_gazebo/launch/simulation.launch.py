@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import sys
 
 from ament_index_python.packages import get_package_share_directory, get_package_prefix
 
@@ -25,6 +26,10 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def _is_true(s: str) -> bool:
+    return str(s).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _split_args(arg_string: str):
     arg_string = (arg_string or "").strip()
     if not arg_string:
@@ -32,25 +37,28 @@ def _split_args(arg_string: str):
     return shlex.split(arg_string, posix=(os.name != "nt"))
 
 
-def _start_gz(context, *args, **kwargs):
+def _start_gz_server(context, *args, **kwargs):
     """
     Cross-platform Gazebo Sim startup:
 
-    - Windows: server-only required (add -s). Optionally launch GUI separately (gz sim -g).
-    - macOS/Linux: default gz sim launches GUI+server; avoid launching a second GUI client.
+    - Windows: must run server-only (-s); GUI must be separate (-g).
+    - macOS (in this robostack setup): must run either -s or -g; cannot combine.
+    - Linux: can run server+GUI in one process; use -s only if headless requested.
     """
     world_path = LaunchConfiguration("world").perform(context)
     gz_args_str = LaunchConfiguration("gz_args").perform(context)
-    headless = LaunchConfiguration("headless").perform(context).lower() in ("1", "true", "yes", "on")
+    headless = _is_true(LaunchConfiguration("headless").perform(context))
 
     extra = _split_args(gz_args_str)
 
-    if os.name == "nt":
-        # Windows requires -s (server-only) when launched this way
+    needs_split_server_gui = (os.name == "nt") or (sys.platform == "darwin")
+
+    if needs_split_server_gui:
+        # Force server mode
         if "-s" not in extra and "--server" not in extra:
             extra = ["-s"] + extra
     else:
-        # macOS/Linux: only add -s if user explicitly requests headless
+        # Linux: only add -s if requested
         if headless and "-s" not in extra and "--server" not in extra:
             extra = ["-s"] + extra
 
@@ -77,9 +85,11 @@ def generate_launch_description():
     yaw = LaunchConfiguration("yaw")
 
     gz_args = LaunchConfiguration("gz_args")
+    headless = LaunchConfiguration("headless")
     start_gui = LaunchConfiguration("start_gui")
     gui_delay = LaunchConfiguration("gui_delay")
-    headless = LaunchConfiguration("headless")
+
+    needs_split_server_gui = (os.name == "nt") or (sys.platform == "darwin")
 
     declare_args = [
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -107,20 +117,20 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "headless",
-            # Windows effectively headless in this workflow; mac/linux default is GUI unless set true.
-            default_value=("true" if os.name == "nt" else "false"),
-            description="Run gz sim headless/server-only (-s).",
+            # On Windows/macOS split mode, the server is always -s anyway.
+            default_value=("true" if needs_split_server_gui else "false"),
+            description="Run gz sim headless/server-only (-s). Linux only; Windows/macOS are effectively headless server.",
         ),
         DeclareLaunchArgument(
             "start_gui",
-            # Only meaningful on Windows (starts separate GUI client process).
-            default_value=("true" if os.name == "nt" else "false"),
-            description="(Windows) Start a separate `gz sim -g` GUI client.",
+            # Default: true on Windows/macOS so students see the GUI without extra terminal steps.
+            default_value=("true" if needs_split_server_gui else "false"),
+            description="Start a separate `gz sim -g` GUI client (required on Windows/macOS in this setup).",
         ),
         DeclareLaunchArgument(
             "gui_delay",
             default_value="2.0",
-            description="Seconds to wait before starting GUI client (Windows).",
+            description="Seconds to wait before starting GUI client (helps ensure server is up).",
         ),
     ]
 
@@ -189,16 +199,19 @@ def generate_launch_description():
     )
 
     # -------------------------
-    # Start gz (single process on mac/linux; server-only on Windows)
+    # Start gz server
     # -------------------------
-    gz = OpaqueFunction(function=_start_gz)
+    gz_server = OpaqueFunction(function=_start_gz_server)
 
     # -------------------------
-    # (Windows only) Start GUI client in a second process if requested
+    # Optional GUI client (separate process)
+    # - Required on Windows/macOS split mode
+    # - Optional on Linux (if user wants it anyway)
     # -------------------------
-    is_windows_and_start_gui = IfCondition(
-        PythonExpression(["'", "true" if os.name == "nt" else "false", "' == 'true' and ", start_gui])
-    )
+    # Condition:
+    #   start_gui AND (Windows/macOS OR headless==true on Linux)
+    # On Linux default start_gui is false, but if user sets true, we'll launch -g.
+    gui_condition = IfCondition(start_gui)
 
     gz_gui = TimerAction(
         period=gui_delay,
@@ -208,7 +221,7 @@ def generate_launch_description():
                 output="screen",
             )
         ],
-        condition=is_windows_and_start_gui,
+        condition=gui_condition,
     )
 
     # -------------------------
@@ -256,7 +269,7 @@ def generate_launch_description():
             set_ign_resource_path,
             set_gz_log_path,
             set_gz_log_path_legacy,
-            gz,
+            gz_server,
             gz_gui,
             robot_state_publisher,
             clock_bridge,
