@@ -42,6 +42,7 @@ class TrajExecutionState:
     start_positions: list[float] = field(default_factory=list)
     done_event: Event = field(default_factory=Event)
     cancelled: bool = False
+    egm_disconnect_abort: bool = False
 
     def reset(self):
         self.points.clear()
@@ -53,6 +54,7 @@ class TrajExecutionState:
         self.start_positions.clear()
         self.done_event.clear()
         self.cancelled = False
+        self.egm_disconnect_abort = False
 
 
 class EGMController(Node):
@@ -186,6 +188,11 @@ class EGMController(Node):
                 if self.egm_connected:
                     self.egm_connected = False
                     self.get_logger().warning("EGM connection lost, no data received")
+                    if self.state == ControllerState.TRAJECTORY:
+                        self.get_logger().error("EGM disconnected during trajectory execution — aborting trajectory")
+                        with self._traj_lock:
+                            self._traj_state.egm_disconnect_abort = True
+                        self._cancel_trajectory_motion()
                 continue
 
             if not self.egm_connected:
@@ -454,6 +461,14 @@ class EGMController(Node):
                 return result
 
             if self._traj_state.done_event.is_set():
+                if self._traj_state.egm_disconnect_abort:
+                    self.get_logger().error("Trajectory aborted due to EGM connection loss")
+                    self.state = ControllerState.IDLE
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = "Trajectory aborted: EGM connection lost"
+                    result.error_code = 4
+                    return result
                 self.get_logger().info("Trajectory execution completed successfully")
                 self.state = ControllerState.IDLE
                 goal_handle.succeed()
